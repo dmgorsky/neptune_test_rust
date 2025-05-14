@@ -216,16 +216,31 @@ impl TradingService {
         }
 
         let mut sum = 0.0;
-        let mut sum_sq = 0.0;
         let mut min_val = f32::INFINITY;
         let mut max_val = f32::NEG_INFINITY;
 
+        // Using Welford's algorithm for calculating sum_sq
+        // This is more numerically stable than the naive approach
+        let mut mean = 0.0;
+        let mut m2 = 0.0;
+        let mut count = 0;
+
         for &val in slice {
+            count += 1;
+            let delta = val - mean;
+            mean += delta / count as f32;
+            let delta2 = val - mean;
+            m2 += delta * delta2;
+
             sum += val;
-            sum_sq += val * val;
             min_val = min_val.min(val);
             max_val = max_val.max(val);
         }
+
+        // For compatibility with the existing code, we convert the Welford's
+        // algorithm results back to sum_sq that can be used with the formula:
+        // variance = sum_sq / n - mean * mean
+        let sum_sq = m2 + count as f32 * mean * mean;
 
         (sum, sum_sq, min_val, max_val)
     }
@@ -296,32 +311,67 @@ impl TradingService {
                 // The original implementation calculates: sum((x_i - mean)^2 / n)
                 // This is different from the standard variance formula: sum((x_i - mean)^2) / n
 
-                let variance = (sum_sq / real_k_float - mean * mean);
+                let variance = sum_sq / real_k_float - mean * mean;
 
                 (*min_val, *max_val, *sum, variance)
             } else {
                 // Fall back to parallel calculation if precomputed values are not available
-                let mean = slice.par_iter().sum::<f32>() / real_k_float;
-
-                slice
+                // Using Welford's algorithm for parallel computation
+                let result = slice
                     .par_iter()
                     .fold(
-                        || (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0.0),
-                        |(min, max, sum, var), &val| {
+                        || (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0.0, 0, 0.0),
+                        |(min, max, sum, m2, count, mean), &val| {
+                            let new_count = count + 1;
+                            let delta = val - mean;
+                            let new_mean = mean + delta / new_count as f32;
+                            let delta2 = val - new_mean;
+                            let new_m2 = m2 + delta * delta2;
+
                             (
                                 min.min(val),
                                 max.max(val),
                                 sum + val,
-                                var + (val - mean) * (val - mean) / real_k_float,
+                                new_m2,
+                                new_count,
+                                new_mean,
                             )
                         },
                     )
                     .reduce(
-                        || (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0.0),
-                        |(min1, max1, sum1, var1), (min2, max2, sum2, var2)| {
-                            (min1.min(min2), max1.max(max2), sum1 + sum2, var1 + var2)
+                        || (f32::INFINITY, f32::NEG_INFINITY, 0.0, 0.0, 0, 0.0),
+                        |(min1, max1, sum1, m2_1, count1, mean1), (min2, max2, sum2, m2_2, count2, mean2)| {
+                            // Combine results from different threads using parallel algorithm
+                            let combined_count = count1 + count2;
+
+                            // If either count is zero, return the other's statistics
+                            if count1 == 0 {
+                                return (min2, max2, sum2, m2_2, count2, mean2);
+                            }
+                            if count2 == 0 {
+                                return (min1, max1, sum1, m2_1, count1, mean1);
+                            }
+
+                            // Combine means and variances using the parallel algorithm
+                            let delta = mean2 - mean1;
+                            let combined_mean = mean1 + delta * (count2 as f32 / combined_count as f32);
+                            let combined_m2 = m2_1 + m2_2 + delta * delta * (count1 as f32 * count2 as f32 / combined_count as f32);
+
+                            (
+                                min1.min(min2),
+                                max1.max(max2),
+                                sum1 + sum2,
+                                combined_m2,
+                                combined_count,
+                                combined_mean,
+                            )
                         },
-                    )
+                    );
+
+                // Extract values from the result tuple and calculate variance
+                let (min, max, sum, m2, count, _) = result;
+                let variance = if count > 0 { m2 / count as f32 } else { 0.0 };
+                (min, max, sum, variance)
             };
 
         // Use the last element in the window as s_last
@@ -384,7 +434,7 @@ impl TradingServices {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[actix_web::test]
     async fn test_update_stats() {
         let trading_service = TradingService::default();
